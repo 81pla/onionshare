@@ -1,24 +1,29 @@
 import os
 import tempfile
+import json
 from datetime import datetime
 from flask import Request, request, render_template, make_response, flash, redirect
 from werkzeug.utils import secure_filename
 
-from ..common import DownloadsDirErrorCannotCreate, DownloadsDirErrorNotWritable
 from .. import strings
 
 
-class ReceiveModeWeb(object):
+class ReceiveModeWeb:
     """
     All of the web logic for receive mode
     """
+
     def __init__(self, common, web):
         self.common = common
-        self.common.log('ReceiveModeWeb', '__init__')
+        self.common.log("ReceiveModeWeb", "__init__")
 
         self.web = web
 
-        self.upload_count = 0
+        self.can_upload = True
+        self.uploads_in_progress = []
+
+        # This tracks the history id
+        self.cur_history_id = 0
 
         self.define_routes()
 
@@ -26,152 +31,130 @@ class ReceiveModeWeb(object):
         """
         The web app routes for receiving files
         """
-        def index_logic():
-            self.web.add_request(self.web.REQUEST_LOAD, request.path)
-
-            if self.common.settings.get('public_mode'):
-                upload_action = '/upload'
-                close_action = '/close'
-            else:
-                upload_action = '/{}/upload'.format(self.web.slug)
-                close_action = '/{}/close'.format(self.web.slug)
-
-            r = make_response(render_template(
-                'receive.html',
-                upload_action=upload_action,
-                close_action=close_action,
-                receive_allow_receiver_shutdown=self.common.settings.get('receive_allow_receiver_shutdown')))
-            return self.web.add_security_headers(r)
-
-        @self.web.app.route("/<slug_candidate>")
-        def index(slug_candidate):
-            self.web.check_slug_candidate(slug_candidate)
-            return index_logic()
 
         @self.web.app.route("/")
-        def index_public():
-            if not self.common.settings.get('public_mode'):
-                return self.web.error404()
-            return index_logic()
+        def index():
+            history_id = self.cur_history_id
+            self.cur_history_id += 1
+            self.web.add_request(
+                self.web.REQUEST_INDIVIDUAL_FILE_STARTED,
+                request.path,
+                {"id": history_id, "status_code": 200},
+            )
 
+            self.web.add_request(self.web.REQUEST_LOAD, request.path)
+            r = make_response(
+                render_template(
+                    "receive.html", static_url_path=self.web.static_url_path
+                )
+            )
+            return self.web.add_security_headers(r)
 
-        def upload_logic(slug_candidate=''):
+        @self.web.app.route("/upload", methods=["POST"])
+        def upload(ajax=False):
             """
-            Upload files.
+            Handle the upload files POST request, though at this point, the files have
+            already been uploaded and saved to their correct locations.
             """
-            # Make sure downloads_dir exists
-            valid = True
-            try:
-                self.common.validate_downloads_dir()
-            except DownloadsDirErrorCannotCreate:
-                self.web.add_request(self.web.REQUEST_ERROR_DOWNLOADS_DIR_CANNOT_CREATE, request.path)
-                print(strings._('error_cannot_create_downloads_dir').format(self.common.settings.get('downloads_dir')))
-                valid = False
-            except DownloadsDirErrorNotWritable:
-                self.web.add_request(self.web.REQUEST_ERROR_DOWNLOADS_DIR_NOT_WRITABLE, request.path)
-                print(strings._('error_downloads_dir_not_writable').format(self.common.settings.get('downloads_dir')))
-                valid = False
-            if not valid:
-                flash('Error uploading, please inform the OnionShare user', 'error')
-                if self.common.settings.get('public_mode'):
-                    return redirect('/')
-                else:
-                    return redirect('/{}'.format(slug_candidate))
-
-            files = request.files.getlist('file[]')
+            files = request.files.getlist("file[]")
             filenames = []
-            print('')
             for f in files:
-                if f.filename != '':
-                    # Automatically rename the file, if a file of the same name already exists
+                if f.filename != "":
                     filename = secure_filename(f.filename)
                     filenames.append(filename)
-                    local_path = os.path.join(self.common.settings.get('downloads_dir'), filename)
-                    if os.path.exists(local_path):
-                        if '.' in filename:
-                            # Add "-i", e.g. change "foo.txt" to "foo-2.txt"
-                            parts = filename.split('.')
-                            name = parts[:-1]
-                            ext = parts[-1]
-
-                            i = 2
-                            valid = False
-                            while not valid:
-                                new_filename = '{}-{}.{}'.format('.'.join(name), i, ext)
-                                local_path = os.path.join(self.common.settings.get('downloads_dir'), new_filename)
-                                if os.path.exists(local_path):
-                                    i += 1
-                                else:
-                                    valid = True
-                        else:
-                            # If no extension, just add "-i", e.g. change "foo" to "foo-2"
-                            i = 2
-                            valid = False
-                            while not valid:
-                                new_filename = '{}-{}'.format(filename, i)
-                                local_path = os.path.join(self.common.settings.get('downloads_dir'), new_filename)
-                                if os.path.exists(local_path):
-                                    i += 1
-                                else:
-                                    valid = True
-
+                    local_path = os.path.join(request.receive_mode_dir, filename)
                     basename = os.path.basename(local_path)
-                    if f.filename != basename:
-                        # Tell the GUI that the file has changed names
-                        self.web.add_request(self.web.REQUEST_UPLOAD_FILE_RENAMED, request.path, {
-                            'id': request.upload_id,
-                            'old_filename': f.filename,
-                            'new_filename': basename
-                        })
 
-                    self.common.log('ReceiveModeWeb', 'define_routes', '/upload, uploaded {}, saving to {}'.format(f.filename, local_path))
-                    print(strings._('receive_mode_received_file').format(local_path))
-                    f.save(local_path)
+                    # Tell the GUI the receive mode directory for this file
+                    self.web.add_request(
+                        self.web.REQUEST_UPLOAD_SET_DIR,
+                        request.path,
+                        {
+                            "id": request.history_id,
+                            "filename": basename,
+                            "dir": request.receive_mode_dir,
+                        },
+                    )
 
-            # Note that flash strings are on English, and not translated, on purpose,
+                    self.common.log(
+                        "ReceiveModeWeb",
+                        "define_routes",
+                        f"/upload, uploaded {f.filename}, saving to {local_path}",
+                    )
+                    print(f"\nReceived: {local_path}")
+
+            if request.upload_error:
+                self.common.log(
+                    "ReceiveModeWeb",
+                    "define_routes",
+                    "/upload, there was an upload error",
+                )
+
+                self.web.add_request(
+                    self.web.REQUEST_ERROR_DATA_DIR_CANNOT_CREATE,
+                    request.path,
+                    {"receive_mode_dir": request.receive_mode_dir},
+                )
+                print(
+                    f"Could not create OnionShare data folder: {request.receive_mode_dir}"
+                )
+
+                msg = "Error uploading, please inform the OnionShare user"
+                if ajax:
+                    return json.dumps({"error_flashes": [msg]})
+                else:
+                    flash(msg, "error")
+                    return redirect("/")
+
+            # Note that flash strings are in English, and not translated, on purpose,
             # to avoid leaking the locale of the OnionShare user
+            if ajax:
+                info_flashes = []
+
             if len(filenames) == 0:
-                flash('No files uploaded', 'info')
+                msg = "No files uploaded"
+                if ajax:
+                    info_flashes.append(msg)
+                else:
+                    flash(msg, "info")
             else:
+                msg = "Sent "
                 for filename in filenames:
-                    flash('Sent {}'.format(filename), 'info')
+                    msg += f"{filename}, "
+                msg = msg.rstrip(", ")
+                if ajax:
+                    info_flashes.append(msg)
+                else:
+                    flash(msg, "info")
 
-            if self.common.settings.get('public_mode'):
-                return redirect('/')
+            if self.can_upload:
+                if ajax:
+                    return json.dumps({"info_flashes": info_flashes})
+                else:
+                    return redirect("/")
             else:
-                return redirect('/{}'.format(slug_candidate))
+                if ajax:
+                    return json.dumps(
+                        {
+                            "new_body": render_template(
+                                "thankyou.html",
+                                static_url_path=self.web.static_url_path,
+                            )
+                        }
+                    )
+                else:
+                    # It was the last upload and the timer ran out
+                    r = make_response(
+                        render_template("thankyou.html"),
+                        static_url_path=self.web.static_url_path,
+                    )
+                    return self.web.add_security_headers(r)
 
-        @self.web.app.route("/<slug_candidate>/upload", methods=['POST'])
-        def upload(slug_candidate):
-            self.web.check_slug_candidate(slug_candidate)
-            return upload_logic(slug_candidate)
-
-        @self.web.app.route("/upload", methods=['POST'])
-        def upload_public():
-            if not self.common.settings.get('public_mode'):
-                return self.web.error404()
-            return upload_logic()
-
-
-        def close_logic(slug_candidate=''):
-            if self.common.settings.get('receive_allow_receiver_shutdown'):
-                self.web.force_shutdown()
-                r = make_response(render_template('closed.html'))
-                self.web.add_request(self.web.REQUEST_CLOSE_SERVER, request.path)
-                return self.web.add_security_headers(r)
-            else:
-                return redirect('/{}'.format(slug_candidate))
-
-        @self.web.app.route("/<slug_candidate>/close", methods=['POST'])
-        def close(slug_candidate):
-            self.web.check_slug_candidate(slug_candidate)
-            return close_logic(slug_candidate)
-
-        @self.web.app.route("/close", methods=['POST'])
-        def close_public():
-            if not self.common.settings.get('public_mode'):
-                return self.web.error404()
-            return close_logic()
+        @self.web.app.route("/upload-ajax", methods=["POST"])
+        def upload_ajax_public():
+            if not self.can_upload:
+                return self.web.error403()
+            return upload(ajax=True)
 
 
 class ReceiveModeWSGIMiddleware(object):
@@ -179,34 +162,69 @@ class ReceiveModeWSGIMiddleware(object):
     Custom WSGI middleware in order to attach the Web object to environ, so
     ReceiveModeRequest can access it.
     """
+
     def __init__(self, app, web):
         self.app = app
         self.web = web
 
     def __call__(self, environ, start_response):
-        environ['web'] = self.web
+        environ["web"] = self.web
+        environ["stop_q"] = self.web.stop_q
         return self.app(environ, start_response)
 
 
-class ReceiveModeTemporaryFile(object):
+class ReceiveModeFile(object):
     """
-    A custom TemporaryFile that tells ReceiveModeRequest every time data gets
-    written to it, in order to track the progress of uploads.
+    A custom file object that tells ReceiveModeRequest every time data gets
+    written to it, in order to track the progress of uploads. It starts out with
+    a .part file extension, and when it's complete it removes that extension.
     """
-    def __init__(self, filename, write_func, close_func):
+
+    def __init__(self, request, filename, write_func, close_func):
+        self.onionshare_request = request
         self.onionshare_filename = filename
         self.onionshare_write_func = write_func
         self.onionshare_close_func = close_func
 
-        # Create a temporary file
-        self.f = tempfile.TemporaryFile('wb+')
+        self.filename = os.path.join(self.onionshare_request.receive_mode_dir, filename)
+        self.filename_in_progress = f"{self.filename}.part"
+
+        # Open the file
+        self.upload_error = False
+        try:
+            self.f = open(self.filename_in_progress, "wb+")
+        except:
+            # This will only happen if someone is messing with the data dir while
+            # OnionShare is running, but if it does make sure to throw an error
+            self.upload_error = True
+            self.f = tempfile.TemporaryFile("wb+")
 
         # Make all the file-like methods and attributes actually access the
         # TemporaryFile, except for write
-        attrs = ['closed', 'detach', 'fileno', 'flush', 'isatty', 'mode',
-                 'name', 'peek', 'raw', 'read', 'read1', 'readable', 'readinto',
-                 'readinto1', 'readline', 'readlines', 'seek', 'seekable', 'tell',
-                 'truncate', 'writable', 'writelines']
+        attrs = [
+            "closed",
+            "detach",
+            "fileno",
+            "flush",
+            "isatty",
+            "mode",
+            "name",
+            "peek",
+            "raw",
+            "read",
+            "read1",
+            "readable",
+            "readinto",
+            "readinto1",
+            "readline",
+            "readlines",
+            "seek",
+            "seekable",
+            "tell",
+            "truncate",
+            "writable",
+            "writelines",
+        ]
         for attr in attrs:
             setattr(self, attr, getattr(self.f, attr))
 
@@ -214,15 +232,33 @@ class ReceiveModeTemporaryFile(object):
         """
         Custom write method that calls out to onionshare_write_func
         """
-        bytes_written = self.f.write(b)
-        self.onionshare_write_func(self.onionshare_filename, bytes_written)
+        if self.upload_error or (not self.onionshare_request.stop_q.empty()):
+            self.close()
+            self.onionshare_request.close()
+            return
+
+        try:
+            bytes_written = self.f.write(b)
+            self.onionshare_write_func(self.onionshare_filename, bytes_written)
+
+        except:
+            self.upload_error = True
 
     def close(self):
         """
         Custom close method that calls out to onionshare_close_func
         """
-        self.f.close()
-        self.onionshare_close_func(self.onionshare_filename)
+        try:
+            self.f.close()
+
+            if not self.upload_error:
+                # Rename the in progress file to the final filename
+                os.rename(self.filename_in_progress, self.filename)
+
+        except:
+            self.upload_error = True
+
+        self.onionshare_close_func(self.onionshare_filename, self.upload_error)
 
 
 class ReceiveModeRequest(Request):
@@ -230,96 +266,212 @@ class ReceiveModeRequest(Request):
     A custom flask Request object that keeps track of how much data has been
     uploaded for each file, for receive mode.
     """
+
     def __init__(self, environ, populate_request=True, shallow=False):
         super(ReceiveModeRequest, self).__init__(environ, populate_request, shallow)
-        self.web = environ['web']
+        self.web = environ["web"]
+        self.stop_q = environ["stop_q"]
+
+        self.web.common.log("ReceiveModeRequest", "__init__")
+
+        # Prevent running the close() method more than once
+        self.closed = False
 
         # Is this a valid upload request?
         self.upload_request = False
-        if self.method == 'POST':
-            if self.path == '/{}/upload'.format(self.web.slug):
+        if self.method == "POST":
+            if self.path == "/upload" or self.path == "/upload-ajax":
                 self.upload_request = True
-            else:
-                if self.web.common.settings.get('public_mode'):
-                    if self.path == '/upload':
-                        self.upload_request = True
 
         if self.upload_request:
+            # No errors yet
+            self.upload_error = False
+
+            # Figure out what files should be saved
+            now = datetime.now()
+            date_dir = now.strftime("%Y-%m-%d")
+            time_dir = now.strftime("%H.%M.%S")
+            self.receive_mode_dir = os.path.join(
+                self.web.common.settings.get("data_dir"), date_dir, time_dir
+            )
+
+            # Create that directory, which shouldn't exist yet
+            try:
+                os.makedirs(self.receive_mode_dir, 0o700, exist_ok=False)
+            except OSError:
+                # If this directory already exists, maybe someone else is uploading files at
+                # the same second, so use a different name in that case
+                if os.path.exists(self.receive_mode_dir):
+                    # Keep going until we find a directory name that's available
+                    i = 1
+                    while True:
+                        new_receive_mode_dir = f"{self.receive_mode_dir}-{i}"
+                        try:
+                            os.makedirs(new_receive_mode_dir, 0o700, exist_ok=False)
+                            self.receive_mode_dir = new_receive_mode_dir
+                            break
+                        except OSError:
+                            pass
+                        i += 1
+                        # Failsafe
+                        if i == 100:
+                            self.web.common.log(
+                                "ReceiveModeRequest",
+                                "__init__",
+                                "Error finding available receive mode directory",
+                            )
+                            self.upload_error = True
+                            break
+            except PermissionError:
+                self.web.add_request(
+                    self.web.REQUEST_ERROR_DATA_DIR_CANNOT_CREATE,
+                    request.path,
+                    {"receive_mode_dir": self.receive_mode_dir},
+                )
+                print(
+                    f"Could not create OnionShare data folder: {self.receive_mode_dir}"
+                )
+                self.web.common.log(
+                    "ReceiveModeRequest",
+                    "__init__",
+                    "Permission denied creating receive mode directory",
+                )
+                self.upload_error = True
+
+            # If there's an error so far, finish early
+            if self.upload_error:
+                return
+
             # A dictionary that maps filenames to the bytes uploaded so far
             self.progress = {}
 
-            # Create an upload_id, attach it to the request
-            self.upload_id = self.web.receive_mode.upload_count
-            self.web.receive_mode.upload_count += 1
+            # Prevent new uploads if we've said so (timer expired)
+            if self.web.receive_mode.can_upload:
 
-            # Figure out the content length
-            try:
-                self.content_length = int(self.headers['Content-Length'])
-            except:
-                self.content_length = 0
+                # Create an history_id, attach it to the request
+                self.history_id = self.web.receive_mode.cur_history_id
+                self.web.receive_mode.cur_history_id += 1
 
-            print("{}: {}".format(
-                datetime.now().strftime("%b %d, %I:%M%p"),
-                strings._("receive_mode_upload_starting").format(self.web.common.human_readable_filesize(self.content_length))
-            ))
+                # Figure out the content length
+                try:
+                    self.content_length = int(self.headers["Content-Length"])
+                except:
+                    self.content_length = 0
 
-            # Tell the GUI
-            self.web.add_request(self.web.REQUEST_STARTED, self.path, {
-                'id': self.upload_id,
-                'content_length': self.content_length
-            })
+                print(
+                    "{}: {}".format(
+                        datetime.now().strftime("%b %d, %I:%M%p"),
+                        strings._("receive_mode_upload_starting").format(
+                            self.web.common.human_readable_filesize(self.content_length)
+                        ),
+                    )
+                )
 
-            self.previous_file = None
+                # Don't tell the GUI that a request has started until we start receiving files
+                self.told_gui_about_request = False
 
-    def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+                self.previous_file = None
+
+    def _get_file_stream(
+        self, total_content_length, content_type, filename=None, content_length=None
+    ):
         """
         This gets called for each file that gets uploaded, and returns an file-like
         writable stream.
         """
         if self.upload_request:
-            self.progress[filename] = {
-                'uploaded_bytes': 0,
-                'complete': False
-            }
+            if not self.told_gui_about_request:
+                # Tell the GUI about the request
+                self.web.add_request(
+                    self.web.REQUEST_STARTED,
+                    self.path,
+                    {"id": self.history_id, "content_length": self.content_length},
+                )
+                self.web.receive_mode.uploads_in_progress.append(self.history_id)
 
-        return ReceiveModeTemporaryFile(filename, self.file_write_func, self.file_close_func)
+                self.told_gui_about_request = True
+
+            self.filename = secure_filename(filename)
+
+            self.progress[self.filename] = {"uploaded_bytes": 0, "complete": False}
+
+        f = ReceiveModeFile(
+            self, self.filename, self.file_write_func, self.file_close_func
+        )
+        if f.upload_error:
+            self.web.common.log(
+                "ReceiveModeRequest", "_get_file_stream", "Error creating file"
+            )
+            self.upload_error = True
+        return f
 
     def close(self):
         """
         Closing the request.
         """
         super(ReceiveModeRequest, self).close()
-        if self.upload_request:
-            # Inform the GUI that the upload has finished
-            self.web.add_request(self.web.REQUEST_UPLOAD_FINISHED, self.path, {
-                'id': self.upload_id
-            })
+
+        # Prevent calling this method more than once per request
+        if self.closed:
+            return
+        self.closed = True
+
+        self.web.common.log("ReceiveModeRequest", "close")
+
+        try:
+            if self.told_gui_about_request:
+                history_id = self.history_id
+
+                if (
+                    not self.web.stop_q.empty()
+                    or not self.progress[self.filename]["complete"]
+                ):
+                    # Inform the GUI that the upload has canceled
+                    self.web.add_request(
+                        self.web.REQUEST_UPLOAD_CANCELED, self.path, {"id": history_id}
+                    )
+                else:
+                    # Inform the GUI that the upload has finished
+                    self.web.add_request(
+                        self.web.REQUEST_UPLOAD_FINISHED, self.path, {"id": history_id}
+                    )
+                self.web.receive_mode.uploads_in_progress.remove(history_id)
+
+        except AttributeError:
+            pass
 
     def file_write_func(self, filename, length):
         """
         This function gets called when a specific file is written to.
         """
+        if self.closed:
+            return
+
         if self.upload_request:
-            self.progress[filename]['uploaded_bytes'] += length
+            self.progress[filename]["uploaded_bytes"] += length
 
             if self.previous_file != filename:
-                if self.previous_file is not None:
-                    print('')
                 self.previous_file = filename
 
-            print('\r=> {:15s} {}'.format(
-                self.web.common.human_readable_filesize(self.progress[filename]['uploaded_bytes']),
-                filename
-            ), end='')
+            print(
+                f"\r=> {self.web.common.human_readable_filesize(self.progress[filename]['uploaded_bytes'])} {filename}",
+                end="",
+            )
 
             # Update the GUI on the upload progress
-            self.web.add_request(self.web.REQUEST_PROGRESS, self.path, {
-                'id': self.upload_id,
-                'progress': self.progress
-            })
+            if self.told_gui_about_request:
+                self.web.add_request(
+                    self.web.REQUEST_PROGRESS,
+                    self.path,
+                    {"id": self.history_id, "progress": self.progress},
+                )
 
-    def file_close_func(self, filename):
+    def file_close_func(self, filename, upload_error=False):
         """
         This function gets called when a specific file is closed.
         """
-        self.progress[filename]['complete'] = True
+        self.progress[filename]["complete"] = True
+
+        # If the file tells us there was an upload error, let the request know as well
+        if upload_error:
+            self.upload_error = True

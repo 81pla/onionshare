@@ -15,7 +15,6 @@ a = Analysis(
         ('../share/torrc_template', 'share'),
         ('../share/torrc_template-obfs4', 'share'),
         ('../share/torrc_template-meek_lite_azure', 'share'),
-        ('../share/torrc_template-windows', 'share'),
         ('../share/images/*', 'share/images'),
         ('../share/locale/*', 'share/locale'),
         ('../share/static/*', 'share/static'),
@@ -59,7 +58,7 @@ if p == 'Darwin':
     app = BUNDLE(
         coll,
         name='OnionShare.app',
-        icon='install/onionshare.icns',
+        icon='onionshare.icns',
         bundle_identifier='com.micahflee.onionshare',
         info_plist={
             'CFBundleShortVersionString': version,
